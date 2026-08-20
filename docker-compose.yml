@@ -1,0 +1,202 @@
+# docker-compose.yml
+# Self-hosted Supabase stack + RAG services.
+#
+# Services:
+#   supabase-db   — Postgres 15 + pgvector
+#   redis         — arq job queue
+#   ollama        — local LLM server (CPU by default; see GPU comment)
+#   ollama-init   — one-shot model pull
+#   app           — FastAPI API server
+#   worker        — arq ingestion worker
+#
+# For ingestion-only dev (no Ollama needed):
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# ---------------------------------------------------------------------------
+# Shared environment anchors
+# ---------------------------------------------------------------------------
+x-db-env: &db-env
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supabase_local_pass}
+  POSTGRES_DB: ${POSTGRES_DB:-postgres}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-supabase_local_pass}@supabase-db:5432/${POSTGRES_DB:-postgres}
+  REDIS_URL: redis://redis:6379
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-large-en-v1.5}
+  EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+  OLLAMA_BASE_URL: http://ollama:11434
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+  SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.5}
+  TOP_K: ${TOP_K:-8}
+  RAW_FILES_DIR: /app/data/raw
+  DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-}
+  SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+  SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+  SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters}
+  # Phase 2 — hybrid retrieval & reranking
+  RERANK_MODEL: ${RERANK_MODEL:-BAAI/bge-reranker-large}
+  RERANK_TOP_N: ${RERANK_TOP_N:-6}
+  HYBRID_CANDIDATE_K: ${HYBRID_CANDIDATE_K:-40}
+  RRF_K: ${RRF_K:-60}
+  GATE_RERANK_THRESHOLD: ${GATE_RERANK_THRESHOLD:-0.0}
+  MMR_ENABLED: ${MMR_ENABLED:-false}
+  MMR_LAMBDA: ${MMR_LAMBDA:-0.5}
+
+services:
+
+  # -------------------------------------------------------------------------
+  # Postgres 15 + pgvector
+  # Using Supabase's official Postgres image which ships with pgvector and
+  # all Supabase extensions pre-installed.
+  # -------------------------------------------------------------------------
+  supabase-db:
+    image: supabase/postgres:15.1.1.78
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      JWT_SECRET: ${SUPABASE_JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters}
+    volumes:
+      - supabase_db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # Redis — arq job queue
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # Ollama — local LLM server (CPU-only by default)
+  #
+  # GPU pass-through (NVIDIA):
+  #   Uncomment the `deploy` block below and ensure the NVIDIA Container
+  #   Toolkit is installed on the host:
+  #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  # -------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    # --- Uncomment for GPU support ---
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # ollama-init — one-shot service that pulls the configured model
+  # by calling the already-running ollama service over the Docker network.
+  # No second 'ollama serve' needed; uses the main ollama container's API.
+  # -------------------------------------------------------------------------
+  ollama-init:
+    image: curlimages/curl:latest
+    restart: "no"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+    entrypoint: >
+      sh -c "
+        echo 'Pulling model: '$$OLLAMA_MODEL &&
+        curl -sf -X POST http://ollama:11434/api/pull
+          -d '{\"model\": \"'$$OLLAMA_MODEL'\"}'
+          --no-buffer &&
+        echo 'Model pull complete.'
+      "
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # FastAPI application
+  # -------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    volumes:
+      - raw_files:/app/data/raw
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s  # Allow time for model weight download on first start
+
+  # -------------------------------------------------------------------------
+  # arq ingestion worker
+  # -------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    volumes:
+      - raw_files:/app/data/raw
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  supabase_db_data:
+    driver: local
+  redis_data:
+    driver: local
+  ollama_models:
+    driver: local
+  raw_files:
+    driver: local
+  hf_cache:
+    driver: local

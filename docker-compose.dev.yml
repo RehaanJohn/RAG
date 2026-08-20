@@ -1,0 +1,26 @@
+# docker-compose.dev.yml
+# Development override: skips Ollama and ollama-init.
+# Use this when you want to test ingestion only (upload + indexing)
+# without waiting for the ~4.7 GB model download.
+#
+# Queries that pass the confidence gate will fail at generation,
+# but the gate itself + refusals work fine without Ollama.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+services:
+  # Disable ollama and ollama-init
+  ollama:
+    deploy:
+      replicas: 0
+
+  ollama-init:
+    deploy:
+      replicas: 0
+
+  # Point app at a dummy Ollama URL so the config doesn't break
+  # (generation calls will simply error; the gate still works)
+  app:
+    environment:
+      OLLAMA_BASE_URL: http://localhost:11434   # unreachable = graceful error

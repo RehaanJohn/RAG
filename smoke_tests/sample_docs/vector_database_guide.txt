@@ -1,0 +1,81 @@
+Vector Database Architecture and pgvector
+
+1. Introduction to Vector Databases
+
+A vector database is a database management system designed to store, index, and query
+high-dimensional numerical vectors. These vectors are typically dense floating-point
+arrays produced by machine learning models such as embedding models.
+
+Vector databases are central infrastructure components in modern AI applications,
+particularly those involving semantic search, recommendation systems, and
+retrieval-augmented generation. Traditional relational databases optimised for
+structured tabular data are poorly suited to nearest-neighbour queries over
+high-dimensional vectors without specialised extensions.
+
+2. pgvector Extension
+
+pgvector is an open-source extension for PostgreSQL that adds native support for
+vector data types and nearest-neighbour search operations. It introduces the
+`vector` column type and distance operators including:
+
+  - <-> (L2 / Euclidean distance)
+  - <#> (negative inner product, equivalent to maximum inner product)
+  - <=> (cosine distance = 1 - cosine similarity)
+
+Using pgvector, applications can store embeddings as regular Postgres columns and
+run vector similarity queries using SQL, benefiting from Postgres's full ACID
+guarantees, Row-Level Security, and JSON support.
+
+3. Index Types in pgvector
+
+pgvector supports two index types:
+
+IVFFlat (Inverted File Flat):
+  Partitions the vector space into lists (Voronoi cells) using k-means clustering.
+  During search, only a configurable number of lists (probes) are scanned.
+  Faster to build than HNSW but typically lower recall at the same speed.
+  Best for large corpora where build time matters.
+
+HNSW (Hierarchical Navigable Small World):
+  Graph-based approximate nearest neighbour structure.
+  Significantly faster queries and higher recall than IVFFlat in most benchmarks.
+  Slower to build; requires more memory.
+  Recommended for production workloads where query latency is critical.
+
+The RAG system described in this document uses an HNSW index with cosine distance
+(vector_cosine_ops) on the chunks.embedding column.
+
+4. Cosine Similarity and Normalisation
+
+Cosine similarity between two vectors A and B is defined as:
+
+  cosine_similarity(A, B) = (A · B) / (||A|| * ||B||)
+
+When both vectors are L2-normalised (||A|| = ||B|| = 1), this simplifies to:
+
+  cosine_similarity(A, B) = A · B
+
+This means that for normalised embeddings, cosine similarity search is equivalent
+to maximum inner product search. Normalising embeddings before storage allows the
+use of the faster <#> operator if needed, and ensures consistent similarity scores.
+
+5. Row-Level Security
+
+Row-Level Security (RLS) in PostgreSQL allows policies to restrict which rows
+a database role or session can access. In a multi-tenant RAG system, RLS policies
+ensure that queries from one tenant cannot access documents or chunks belonging
+to another tenant.
+
+Policies are evaluated automatically by the query planner for every query. The
+ingestion worker bypasses RLS using a service-role context, which is set via a
+session-level configuration variable before any data access.
+
+6. Connection Pooling
+
+Production deployments should use a connection pool to avoid the overhead of
+creating a new Postgres connection for each HTTP request. asyncpg's built-in
+pool (asyncpg.create_pool) maintains a configurable number of persistent
+connections and lends them to request handlers on demand.
+
+Recommended settings for the RAG API: min_size=2, max_size=20. Adjust max_size
+based on Postgres's max_connections setting (default 100).

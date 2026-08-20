@@ -1,0 +1,76 @@
+# Postgres Full-Text Search: A Technical Reference
+
+## Overview
+
+Postgres full-text search (FTS) uses tsvector documents and tsquery queries
+to match natural language content. Unlike exact string matching, FTS
+understands word stems, stop words, and ranking algorithms.
+
+## Key Data Types
+
+**tsvector** — a preprocessed representation of a document. Each unique
+lexeme is stored along with its positions. Example:
+
+    to_tsvector('english', 'fast cats eat slowly') → 'cat':2 'eat':3 'fast':1
+
+**tsquery** — represents a search condition using lexemes combined with
+boolean operators (&, |, !) and phrase operators (<->).
+
+## Creating FTS Indexes
+
+A **GIN index** (Generalized Inverted Index) is the standard index type
+for tsvector columns. It provides fast lookup for full-text search:
+
+    CREATE INDEX idx_chunks_content_tsv
+        ON chunks USING gin(content_tsv);
+
+A **GiST index** is an alternative with faster update performance but
+slower queries — preferred for frequently-updated tables.
+
+## Generated Columns for FTS
+
+The most efficient approach is a stored generated tsvector column:
+
+    ALTER TABLE chunks
+        ADD COLUMN content_tsv
+            tsvector GENERATED ALWAYS AS
+            (to_tsvector('english', content)) STORED;
+
+This eliminates the need to maintain the tsvector manually. Postgres
+recomputes it automatically on INSERT/UPDATE.
+
+## Ranking Functions
+
+**ts_rank** — computes relevance based on lexeme frequency.
+
+**ts_rank_cd** — (cover density ranking) additionally accounts for
+proximity between query terms. More accurate for multi-word queries:
+
+    ts_rank_cd(content_tsv, websearch_to_tsquery('english', 'GIN index'))
+
+## Query Types
+
+| Function | Description |
+|---|---|
+| `to_tsquery` | Strict boolean syntax (AND: `&`, OR: `|`) |
+| `plainto_tsquery` | Converts natural text to AND query |
+| `websearch_to_tsquery` | Google-style: quotes for phrases, `-` for NOT |
+| `phraseto_tsquery` | Requires adjacent words in order |
+
+**websearch_to_tsquery** is preferred for user-facing search because it
+handles unstructured input gracefully and avoids syntax errors.
+
+## Hybrid Search with RRF
+
+Reciprocal Rank Fusion (RRF) combines ranked lists from different retrieval
+methods. The formula:
+
+    score(d) = Σ  1 / (k + rank_i(d))
+
+where k=60 is the standard smoothing constant. This prevents any single
+very high rank from dominating the fused score, giving a balanced result
+across vector similarity and full-text keyword matching.
+
+The tsvector index enables the FTS leg of hybrid search to run in
+milliseconds even over millions of chunks, making real-time hybrid
+retrieval practical at scale.
