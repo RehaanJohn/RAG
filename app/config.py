@@ -219,10 +219,54 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Phase 4: VLM & Image Support
+    # ------------------------------------------------------------------
+    vlm_model: str = Field(
+        default="llama3.2-vision",
+        description=(
+            "Ollama model tag for visual captioning and image Q&A. "
+            "This model is OPTIONAL — if not pulled, image captioning is skipped "
+            "gracefully and the system remains fully functional for text-only docs. "
+            "Pull with: docker exec rag-ollama-1 ollama pull llama3.2-vision"
+        ),
+    )
+    vlm_timeout: int = Field(
+        default=300,
+        description="HTTP timeout in seconds for VLM calls (image processing is slower than text).",
+    )
+    image_min_size_px: int = Field(
+        default=50,
+        description="Skip extracted images smaller than this in either dimension (logos, decorators).",
+    )
+    image_max_per_page: int = Field(
+        default=10,
+        description="Maximum images to extract per PDF page (guard against tiled images).",
+    )
+    images_dir: str = Field(
+        default="/app/data/images",
+        description="Base directory for extracted image files (must be in a persistent Docker volume).",
+    )
+    image_search_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable image retrieval in hybrid search. "
+            "Set to false to query text-only even if image records exist."
+        ),
+    )
+    image_ref_classify_enabled: bool = Field(
+        default=True,
+        description=(
+            "When conversation_id is present and recent images exist, fire a lightweight "
+            "LLM call to detect if the question refers to a previously-shown image. "
+            "Disable to always run full retrieval regardless of conversation context."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Application
     # ------------------------------------------------------------------
     version: str = Field(
-        default="2.0.0",
+        default="3.0.0",
         description="Application version surfaced in /health and docs.",
     )
 

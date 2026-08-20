@@ -1,16 +1,29 @@
-# RAG System — Phase 1
+# RAG System — Phase 4 Multimodal Image Support (Local VLM)
 
-A production-grade, **fully local** Retrieval-Augmented Generation pipeline.
-Every model runs on your own hardware. No data leaves your infrastructure.
+A production-grade, **fully local and self-hosted** Retrieval-Augmented Generation pipeline.
+Every model (embeddings, cross-encoder reranker, text generation, and vision-language model) runs on your own hardware. **No data ever leaves your infrastructure.**
 
-| Component | Technology |
-|---|---|
-| API | FastAPI + asyncpg |
-| Database | Self-hosted Supabase (Postgres 15 + pgvector) |
-| Embeddings | `sentence-transformers` (in-process, CPU/GPU) |
-| Generation | Local Ollama (`llama3.1:8b` by default) |
-| Background jobs | `arq` (Redis-backed) |
-| Containerisation | Docker Compose |
+| Component | Technology | Model / Spec |
+|---|---|---|
+| API | FastAPI + asyncpg | Async throughout |
+| Database | Self-hosted Supabase | Postgres 15 + pgvector + GIN FTS |
+| Embeddings | `sentence-transformers` | `BAAI/bge-large-en-v1.5` (1024-dim, in-process) |
+| Reranker | `sentence-transformers` CrossEncoder | `BAAI/bge-reranker-large` (in-process) |
+| Generation | Local Ollama | `llama3.1:8b` (configurable) |
+| Vision VLM | Local Ollama | `llama3.2-vision` (configurable, optional) |
+| Background jobs | `arq` + Redis | Async document parsing, chunking, VLM captioning |
+| Containerisation | Docker Compose | Multi-container local deployment |
+
+---
+
+## What's New in Phase 4: Multimodal Images
+
+1. **PDF Image Extraction & VLM Captioning**: Embedded diagrams and images are automatically extracted using PyMuPDF during background ingestion, saved to disk, captioned with the local VLM (`llama3.2-vision`), and embedded into vector search.
+2. **Multimodal Hybrid Retrieval**: Images and text chunks compete on equal footing via 4-way parallel search (vector chunks, FTS chunks, vector image captions, FTS image captions) fused via Reciprocal Rank Fusion (RRF) and scored by the CrossEncoder reranker.
+3. **Inline Image Citations**: When an image is relevant, the LLM cites it with `[doc_id:img_N]`. The API validates the citation and returns a structured `type: "image"` source object with `image_url` for inline rendering in chat UIs.
+4. **Interactive Visual Q&A (`POST /images/{id}/ask`)**: Direct visual question-answering on a specific image, bypassing text retrieval.
+5. **Conversational Image Auto-Routing**: When `conversation_id` is supplied, recently-shown images are tracked in Redis and follow-up visual questions are auto-routed to direct visual Q&A.
+6. **Graceful Degradation**: The VLM model is optional. If `llama3.2-vision` is not pulled, captioning is skipped silently during ingestion without breaking document processing or text search.
 
 ---
 
@@ -19,15 +32,14 @@ Every model runs on your own hardware. No data leaves your infrastructure.
 ### 1. Prerequisites
 
 - Docker ≥ 24 and Docker Compose v2
-- ~10 GB free disk space (Ollama model ~4.7 GB + Postgres data + image layers)
-- No GPU required (CPU-only by default)
+- Free disk space for local models
+- No GPU required (CPU-only by default; GPU optional)
 
 ### 2. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env — at minimum set a real SUPABASE_JWT_SECRET (32+ chars)
-# All other defaults work for local dev
+# Edit .env to set your secrets or customize model names
 ```
 
 ### 3. Start the stack
@@ -36,26 +48,19 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-This will:
-1. Build the FastAPI app and worker images (downloads embedding model weights into the image)
-2. Start Postgres, Redis, and Ollama
-3. Run `ollama pull llama3.1:8b` (~4.7 GB download on first run)
-4. Apply the database migration (`migrations/001_init.sql`)
-5. Start the API on `http://localhost:8000`
+### 4. (Optional) Pull the Vision Model
 
-**First start takes 5–15 minutes** while the Ollama model downloads.
-
-Monitor progress:
+To enable image captioning and visual Q&A:
 ```bash
-docker compose logs -f
-docker compose logs -f ollama-init   # watch model pull progress
+docker exec rag-ollama-1 ollama pull llama3.2-vision
 ```
+*Note: VLM captioning runs in the background arq worker. On CPU without GPU, captioning a document with diagrams may take a few minutes.*
 
-### 4. Verify
+### 5. Verify
 
 ```bash
 curl http://localhost:8000/health
-# → {"status":"ok","version":"1.0.0"}
+# → {"status":"ok","version":"3.0.0"}
 ```
 
 - **API docs**: http://localhost:8000/docs
@@ -66,210 +71,96 @@ curl http://localhost:8000/health
 ## API Reference
 
 ### Upload a document
-
 ```bash
 curl -X POST http://localhost:8000/documents \
-  -F "file=@/path/to/document.pdf" \
-  -F "tenant_id=<your-uuid>"
+  -F "file=@sample_docs/architecture_diagram.pdf" \
+  -F "tenant_id=00000000-0000-0000-0000-000000000001"
 ```
 
-**Response** (202 Accepted):
-```json
-{
-  "doc_id": "3f2504e0-...",
-  "status": "pending",
-  "message": "Document received and queued for ingestion."
-}
-```
-
-Supported file types: `.pdf`, `.txt`, `.md`
-
-### Poll ingestion status
-
-```bash
-curl http://localhost:8000/documents/<doc_id>
-```
-
-Status progression: `pending → parsing → chunking → embedding → indexed`
-(or `failed` with `error_message` on failure)
-
-### Query the knowledge base
-
+### Query the knowledge base (Multimodal RAG)
 ```bash
 curl -X POST http://localhost:8000/query \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "What is retrieval-augmented generation?",
-    "tenant_id": "<your-uuid>",
-    "top_k": 8
+    "query": "What is the query latency for pgvector HNSW in the benchmark chart?",
+    "tenant_id": "00000000-0000-0000-0000-000000000001",
+    "conversation_id": "00000000-0000-0000-0000-000000000099"
   }'
 ```
 
-**Response**:
+**Response Example (with inline image citation):**
 ```json
 {
-  "query": "What is retrieval-augmented generation?",
-  "answer": "RAG is a technique that... [doc_uuid:2] ...",
+  "query": "What is the query latency for pgvector HNSW in the benchmark chart?",
+  "answer": "According to the benchmark chart [doc_uuid:img_0], pgvector HNSW achieves an average query latency of 12 ms.",
   "was_refused": false,
-  "top_similarity_score": 0.847,
+  "top_similarity_score": 1.0,
   "sources": [
     {
-      "citation_id": "doc_uuid:2",
-      "filename": "rag_overview.md",
-      "page_number": null,
-      "section_path": "What is RAG?",
-      "score": 0.847
+      "type": "image",
+      "citation_id": "doc_uuid:img_0",
+      "filename": "architecture_diagram.pdf",
+      "page_number": 1,
+      "score": 0.94,
+      "image_url": "/images/files/00000000-0000-0000-0000-00000001/doc_uuid/page_1_img_0.png"
     }
   ],
-  "latency_ms": 1423
+  "latency_ms": 1850,
+  "routed_to_image_qa": false
 }
 ```
 
-If the query doesn't match any indexed content (score < threshold):
-```json
-{
-  "was_refused": true,
-  "answer": "I couldn't find anything in the knowledge base that answers this. Try rephrasing, or this may be outside what's currently indexed.",
-  "sources": []
-}
+### Direct Visual Q&A on a specific image
+```bash
+curl -X POST http://localhost:8000/images/<image_id>/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is the color of the pgvector bar in this chart?",
+    "tenant_id": "00000000-0000-0000-0000-000000000001"
+  }'
+```
+
+### Download / View Raw Image File
+```bash
+curl "http://localhost:8000/images/<image_id>/file?tenant_id=00000000-0000-0000-0000-000000000001"
 ```
 
 ---
 
 ## Smoke Tests
 
-Run the end-to-end smoke test suite against a running stack:
+Generate sample test files (including PDF with chart) and run the end-to-end test suite:
 
 ```bash
-# Install test deps (httpx)
-pip install httpx
+# 1. Generate test PDF diagram
+python3 smoke_tests/generate_test_pdf.py
 
-# Run tests (generates a random tenant_id by default)
-python smoke_tests/run_smoke_tests.py
-
-# Use a specific tenant_id
-python smoke_tests/run_smoke_tests.py --tenant-id <uuid>
-
-# Against a remote deployment
-python smoke_tests/run_smoke_tests.py --base-url http://your-server:8000
+# 2. Run test suite
+python3 smoke_tests/run_smoke_tests.py \
+  --tenant-id 00000000-0000-0000-0000-000000000001
 ```
 
-The script:
-1. Uploads sample documents from `smoke_tests/sample_docs/`
-2. Waits for indexing to complete (up to 5 minutes)
-3. Runs 5 in-domain queries — asserts `was_refused=False` and `sources` non-empty
-4. Runs 3 out-of-domain queries — asserts `was_refused=True`
-
 ---
 
-## Swapping Models
-
-### Change the embedding model
-
-> ⚠️ Changing the embedding model requires re-indexing all existing documents
-> (embeddings are not cross-model comparable) and updating the `vector(1024)`
-> dimension in the migration if the new model has a different output size.
-
-1. Edit `.env`:
-   ```
-   EMBEDDING_MODEL=intfloat/e5-large-v2   # also 1024-dim, compatible
-   ```
-2. If the new model has a different dimension, update `migrations/001_init.sql`:
-   ```sql
-   -- Change vector(1024) → vector(768) for base-sized models
-   ```
-3. Rebuild:
-   ```bash
-   docker compose build --build-arg EMBEDDING_MODEL=intfloat/e5-large-v2 app worker
-   docker compose up -d
-   ```
-
-### Change the generation model
-
-1. Edit `.env`:
-   ```
-   OLLAMA_MODEL=mistral:7b
-   ```
-2. Restart the stack. The `ollama-init` service will pull the new model:
-   ```bash
-   docker compose up -d
-   docker compose logs -f ollama-init
-   ```
-
-Popular alternatives:
-| Model | Size | Notes |
-|---|---|---|
-| `llama3.1:8b` | 4.7 GB | Default; strong general reasoning |
-| `mistral:7b` | 4.1 GB | Fast, good instruction following |
-| `phi3:mini` | 2.3 GB | Lightweight, good for CPU |
-| `gemma2:9b` | 5.5 GB | Google's model, strong performance |
-
----
-
-## Environment Variables
-
-See [`.env.example`](.env.example) for a fully documented list. Key variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `DATABASE_URL` | — | asyncpg Postgres DSN |
-| `EMBEDDING_MODEL` | `BAAI/bge-large-en-v1.5` | Local sentence-transformers model |
-| `OLLAMA_MODEL` | `llama3.1:8b` | Local Ollama generation model |
-| `SIMILARITY_THRESHOLD` | `0.5` | Gate threshold; below this → refusal |
-| `TOP_K` | `8` | Default retrieval k |
-| `CHUNK_TARGET_TOKENS` | `384` | Target tokens per chunk |
-| `SUPABASE_SERVICE_ROLE_KEY` | — | Worker-only; never expose to clients |
-
----
-
-## Architecture
+## Architecture Diagram
 
 ```
 Client
   │
-  ▼
-FastAPI (app)
-  ├── POST /documents ──► Save file ──► Create DB row ──► Enqueue arq job
-  │                                                              │
-  │                                                              ▼
-  │                                                       arq Worker
-  │                                                         Parse → Chunk
-  │                                                         Embed (local)
-  │                                                         Index → pgvector
+  ├── POST /documents ──► Ingestion Worker (arq)
+  │                         ├── Parse text & structure (pdfplumber)
+  │                         ├── Chunk & Embed (sentence-transformers)
+  │                         ├── Extract images (PyMuPDF)
+  │                         ├── Caption images (local Ollama VLM)
+  │                         └── Embed captions into images table (pgvector + GIN)
   │
-  └── POST /query ──► Embed query (local)
-                    ──► pgvector cosine search
-                    ──► Confidence gate (score < threshold → refusal)
-                    ──► Context assembly + citation tags
-                    ──► Ollama local LLM
-                    ──► Citation validation (uncited claims + hallucination check)
-                    ──► Retry once if invalid
-                    ──► Refusal fallback if retry fails
-                    ──► Log to query_logs
-                    ──► Return {answer, sources, was_refused}
+  ├── POST /query     ──► Multimodal Hybrid Retrieval
+  │                         ├── 4-way parallel search (vector/FTS on chunks + images)
+  │                         ├── Reciprocal Rank Fusion (RRF)
+  │                         ├── CrossEncoder reranking
+  │                         ├── Confidence gate check
+  │                         ├── Ollama Generation with [doc_id:img_N] citation rules
+  │                         └── Return Answer + Sources (with image_url)
+  │
+  └── POST /images/{id}/ask ──► Direct VLM Visual Q&A
 ```
-
----
-
-## Security Notes
-
-- **Service-role key** (`SUPABASE_SERVICE_ROLE_KEY`) bypasses Row-Level Security.
-  It is used exclusively by the ingestion worker. Never include it in frontend code
-  or expose it to API clients.
-- **RLS** is enabled on `documents` and `chunks`. All tenant queries run in
-  tenant context (`app.tenant_id` session variable set per request).
-- **No external network calls**: all model inference is local. Verify this in
-  production by inspecting `docker compose logs` for unexpected outbound connections.
-- **Phase 2 auth**: the `tenant_id`-in-request-body pattern is intentionally
-  simplified for Phase 1. Replace with JWT middleware before production deployment.
-
----
-
-## What's NOT in Phase 1
-
-These features are reserved for later phases:
-- Hybrid keyword + semantic search (BM25 + pgvector RRF)
-- Cross-encoder reranker
-- Query transformation (HyDE, multi-query expansion)
-- Semantic cache
-- Real JWT authentication middleware

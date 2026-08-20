@@ -4,11 +4,11 @@ app/main.py
 FastAPI application entry point.
 
 Lifecycle:
-  startup:  load embedding model, create asyncpg pool, run DB migrations
-  shutdown: close DB pool
+  startup:  load models, create asyncpg pool, connect Redis, run DB migrations
+  shutdown: close DB pool, close Redis connection
 
 All heavy initialisation happens once in the lifespan context manager so
-every request after the first benefits from warm resources.
+every request benefits from warm resources.
 """
 from __future__ import annotations
 
@@ -20,12 +20,14 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import asyncpg
+import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.routers import documents, query
+from app.routers import documents, images, query
 from app.services.embedder import load_embedder
 from app.services.reranker import load_reranker
 
@@ -52,10 +54,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     All resources stored on app.state are available via request.app.state
     in dependency functions.
     """
-    logger.info("=== RAG API starting up ===")
+    logger.info("=== RAG API starting up (Phase 4 Multimodal) ===")
 
-    # 1. Ensure raw file storage directory exists
+    # 1. Ensure storage directories exist
     Path(settings.raw_files_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.images_dir).mkdir(parents=True, exist_ok=True)
 
     # 2. Load embedding model (downloads on first start, cached in hf_cache volume)
     logger.info("Loading embedding model: %s", settings.embedding_model)
@@ -67,7 +70,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.reranker = load_reranker()
     logger.info("Reranker ready: %s", app.state.reranker.model_name)
 
-    # 4. Create asyncpg connection pool
+    # 4. Redis connection for conversation history and job tracking
+    logger.info("Connecting to Redis: %s", settings.redis_url)
+    app.state.redis = aioredis.from_url(settings.redis_url)
+    logger.info("Redis client ready.")
+
+    # 5. Create asyncpg connection pool
     logger.info("Connecting to database…")
 
     async def _init_conn(conn: asyncpg.Connection) -> None:
@@ -100,9 +108,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     logger.info("Database pool ready.")
 
-    # 5. Apply Phase 1 + Phase 2 migrations (idempotent SQL)
+    # 6. Apply database migrations (idempotent SQL)
     migrations_dir = Path(__file__).parent.parent / "migrations"
-    for migration_name in ["001_init.sql", "002_phase2.sql"]:
+    for migration_name in ["001_init.sql", "002_phase2.sql", "003_phase4_images.sql"]:
         migration_file = migrations_dir / migration_name
         if migration_file.exists():
             logger.info("Applying migration: %s", migration_name)
@@ -122,8 +130,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown
     logger.info("=== RAG API shutting down ===")
-    await app.state.db_pool.close()
-    logger.info("Database pool closed.")
+    if hasattr(app.state, "redis"):
+        await app.state.redis.aclose()
+        logger.info("Redis connection closed.")
+    if hasattr(app.state, "db_pool"):
+        await app.state.db_pool.close()
+        logger.info("Database pool closed.")
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +145,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title="RAG API",
     description=(
-        "Phase 2 — Hybrid Search + Local Reranker. "
-        "Vector + FTS retrieval, RRF fusion, CrossEncoder reranking. "
+        "Phase 4 — Multimodal Image Support & Local VLM. "
+        "Hybrid Search (Vector + FTS) over Text and Image Captions, "
+        "CrossEncoder reranking, and Interactive Visual Q&A. "
         "All models run locally. No external API calls."
     ),
     version=settings.version,
@@ -152,10 +165,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Static file serving for extracted images
+# Served at /images/files/{tenant_id}/{doc_id}/page_{n}_img_{i}.png
+app.mount(
+    "/images/files",
+    StaticFiles(directory=settings.images_dir, check_dir=False),
+    name="image_files",
+)
+
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
 app.include_router(documents.router)
+app.include_router(images.router)
 app.include_router(query.router)
 
 
@@ -174,7 +196,7 @@ async def root() -> JSONResponse:
     return JSONResponse(
         {
             "service": "RAG API",
-            "phase": 2,
+            "phase": 4,
             "docs": "/docs",
             "health": "/health",
         }

@@ -3,13 +3,14 @@ app/services/citation.py
 
 Citation parsing, validation, and resolution.
 
-Citation format used in LLM output: [doc_uuid:chunk_index]
-Example: [3f2504e0-4f89-11d3-9a0c-0305e82c3301:4]
+Citation format used in LLM output:
+  Text chunks: [doc_uuid:chunk_index]         e.g. [3f2504e0...:4]
+  Images:      [doc_uuid:img_image_index]      e.g. [3f2504e0...:img_2]
 
 Three validation rules are enforced (in order):
   1. Every sentence containing a factual claim must carry ≥1 citation.
   2. Every cited ID must exist in the retrieved set (no hallucinated citations).
-  3. Every cited ID must resolve to a real chunk in our DB results.
+  3. Every cited ID must resolve to a real chunk or image in our DB results.
 """
 from __future__ import annotations
 
@@ -17,14 +18,14 @@ import logging
 import re
 import uuid
 
-from app.models.schemas import ChunkResult, DocumentResponse, SourceObject
+from app.models.schemas import ChunkResult, DocumentResponse, ImageResult, SourceObject
 
 logger = logging.getLogger(__name__)
 
-# Matches: [<uuid>:<integer>]
-# UUID is hex with optional hyphens; chunk_index is a non-negative integer.
+# Matches text citations:  [uuid:N]      e.g. [3f2504e0...:4]
+# Matches image citations: [uuid:img_N]  e.g. [3f2504e0...:img_2]
 _CITATION_RE = re.compile(
-    r"\[([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+)\]",
+    r"\[([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:(?:img_)?\d+)\]",
     re.IGNORECASE,
 )
 
@@ -109,21 +110,32 @@ def resolve_citations(
     cited_ids: list[str],
     chunks: list[ChunkResult],
     documents: dict[uuid.UUID, DocumentResponse],
+    images: list[ImageResult] | None = None,
+    base_url: str = "",
 ) -> list[SourceObject]:
     """
-    Convert raw citation IDs to structured SourceObject instances that the
-    client can use to link back to the original document.
+    Convert raw citation IDs to structured SourceObject instances.
+
+    Handles both text chunk citations (uuid:N) and image citations (uuid:img_N).
+    Image entries are enriched with image_url so clients can render them inline.
 
     Args:
-        cited_ids: IDs parsed from the model output, e.g. ["uuid:3"].
-        chunks: The retrieved chunk results for this query.
+        cited_ids: IDs parsed from the model output.
+        chunks: Retrieved text chunk results.
         documents: Map from doc_id → DocumentResponse.
+        images: Retrieved image results (Phase 4).
+        base_url: Optional base URL prefix for image URLs.
 
     Returns:
         Deduplicated list of SourceObject, ordered by first appearance.
     """
-    # Build lookup: citation_id → ChunkResult
+    from app.services.image_store import storage_path_to_url
+
+    # Build lookups
     chunk_map: dict[str, ChunkResult] = {c.citation_id: c for c in chunks}
+    image_map: dict[str, ImageResult] = {}
+    if images:
+        image_map = {img.citation_id: img for img in images}
 
     seen: set[str] = set()
     sources: list[SourceObject] = []
@@ -133,23 +145,42 @@ def resolve_citations(
             continue
         seen.add(cid)
 
-        chunk = chunk_map.get(cid)
-        if chunk is None:
-            # Safety: skip IDs that don't map to a retrieved chunk
-            logger.debug("Citation %s not in retrieved chunk map — skipping.", cid)
+        # --- Text chunk citation ---
+        if cid in chunk_map:
+            chunk = chunk_map[cid]
+            doc = documents.get(chunk.doc_id)
+            filename = doc.filename if doc else "unknown"
+            sources.append(
+                SourceObject(
+                    type="text",
+                    citation_id=cid,
+                    filename=filename,
+                    page_number=chunk.metadata.get("page_number"),
+                    section_path=chunk.metadata.get("section_path"),
+                    score=chunk.score,
+                )
+            )
             continue
 
-        doc = documents.get(chunk.doc_id)
-        filename = doc.filename if doc else "unknown"
-
-        sources.append(
-            SourceObject(
-                citation_id=cid,
-                filename=filename,
-                page_number=chunk.metadata.get("page_number"),
-                section_path=chunk.metadata.get("section_path"),
-                score=chunk.score,
+        # --- Image citation ---
+        if cid in image_map:
+            img = image_map[cid]
+            doc = documents.get(img.doc_id)
+            filename = doc.filename if doc else "unknown"
+            image_url = storage_path_to_url(img.storage_path, base_url)
+            sources.append(
+                SourceObject(
+                    type="image",
+                    citation_id=cid,
+                    filename=filename,
+                    page_number=img.page_number,
+                    score=img.score,
+                    image_url=image_url,
+                )
             )
-        )
+            continue
+
+        # --- Citation not found in retrieved set ---
+        logger.debug("Citation %s not in retrieved set — skipping.", cid)
 
     return sources

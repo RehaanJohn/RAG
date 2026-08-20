@@ -11,7 +11,7 @@ from typing import Any
 
 import asyncpg
 
-from app.models.schemas import ChunkResult, DocStatus, DocumentResponse
+from app.models.schemas import ChunkResult, DocStatus, DocumentResponse, ImageResult
 
 
 # ---------------------------------------------------------------------------
@@ -309,3 +309,206 @@ async def log_query(
         rerank_scores,        # JSONB codec handles dict → jsonb
         retrieval_candidate_count,
     )
+
+
+# ---------------------------------------------------------------------------
+# images table (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+async def insert_image(
+    conn: asyncpg.Connection,
+    *,
+    doc_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    page_number: int | None,
+    image_index: int,
+    storage_path: str,
+    bbox: dict | None = None,
+    nearby_chunk_id: uuid.UUID | None = None,
+) -> uuid.UUID:
+    """
+    Insert an image stub row (no caption/embedding yet).
+    Caption and embedding are added after VLM captioning via update_image_caption.
+    Returns the new image UUID.
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO images
+            (doc_id, tenant_id, page_number, image_index, storage_path,
+             bbox, nearby_chunk_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
+        """,
+        doc_id,
+        tenant_id,
+        page_number,
+        image_index,
+        storage_path,
+        bbox,
+        nearby_chunk_id,
+    )
+    return row["id"]
+
+
+async def update_image_caption(
+    conn: asyncpg.Connection,
+    image_id: uuid.UUID,
+    caption: str,
+    embedding: list[float],
+) -> None:
+    """Set caption and embedding after VLM processing."""
+    await conn.execute(
+        """
+        UPDATE images
+        SET caption = $1, embedding = $2::vector
+        WHERE id = $3
+        """,
+        caption,
+        str(embedding),
+        image_id,
+    )
+
+
+async def get_image(
+    conn: asyncpg.Connection,
+    image_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+) -> ImageResult | None:
+    """
+    Fetch a single image row, enforcing tenant_id ownership.
+    Returns None if not found or tenant mismatch.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, doc_id, page_number, image_index,
+               storage_path, caption, tenant_id
+        FROM images
+        WHERE id = $1 AND tenant_id = $2
+        """,
+        image_id,
+        tenant_id,
+    )
+    if row is None:
+        return None
+    return ImageResult(
+        id=row["id"],
+        doc_id=row["doc_id"],
+        page_number=row["page_number"],
+        image_index=row["image_index"],
+        storage_path=row["storage_path"],
+        caption=row["caption"],
+        score=0.0,
+    )
+
+
+async def similarity_search_images(
+    conn: asyncpg.Connection,
+    *,
+    query_embedding: list[float],
+    tenant_id: uuid.UUID,
+    top_k: int,
+) -> list[ImageResult]:
+    """
+    Cosine similarity search on image caption embeddings.
+    Only returns images that have non-NULL embeddings (VLM captioning complete).
+    """
+    rows = await conn.fetch(
+        """
+        SELECT
+            id, doc_id, page_number, image_index, storage_path, caption,
+            1 - (embedding <=> $1::vector) AS score
+        FROM images
+        WHERE tenant_id = $2
+          AND embedding IS NOT NULL
+        ORDER BY embedding <=> $1::vector
+        LIMIT $3
+        """,
+        str(query_embedding),
+        tenant_id,
+        top_k,
+    )
+    return [
+        ImageResult(
+            id=row["id"],
+            doc_id=row["doc_id"],
+            page_number=row["page_number"],
+            image_index=row["image_index"],
+            storage_path=row["storage_path"],
+            caption=row["caption"],
+            score=float(row["score"]),
+        )
+        for row in rows
+    ]
+
+
+async def full_text_search_images(
+    conn: asyncpg.Connection,
+    *,
+    query: str,
+    tenant_id: uuid.UUID,
+    top_k: int,
+) -> list[ImageResult]:
+    """
+    Full-text search on image captions via tsvector.
+    Only returns images that have a non-NULL caption.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT
+                id, doc_id, page_number, image_index, storage_path, caption,
+                ts_rank_cd(caption_tsv,
+                           websearch_to_tsquery('english', $1)) AS score
+            FROM images
+            WHERE tenant_id = $2
+              AND caption IS NOT NULL
+              AND caption_tsv @@ websearch_to_tsquery('english', $1)
+            ORDER BY score DESC
+            LIMIT $3
+            """,
+            query,
+            tenant_id,
+            top_k,
+        )
+    except asyncpg.PostgresError:
+        return []
+
+    return [
+        ImageResult(
+            id=row["id"],
+            doc_id=row["doc_id"],
+            page_number=row["page_number"],
+            image_index=row["image_index"],
+            storage_path=row["storage_path"],
+            caption=row["caption"],
+            score=float(row["score"]),
+        )
+        for row in rows
+    ]
+
+
+async def find_nearby_chunk_id(
+    conn: asyncpg.Connection,
+    doc_id: uuid.UUID,
+    page_number: int | None,
+) -> uuid.UUID | None:
+    """
+    Find the ID of the chunk on the same page as the image.
+    Used to populate images.nearby_chunk_id for layout-context linking.
+    Returns None if no chunk exists on that page.
+    """
+    if page_number is None:
+        return None
+    row = await conn.fetchrow(
+        """
+        SELECT id FROM chunks
+        WHERE doc_id = $1
+          AND (metadata->>'page_number')::int = $2
+        ORDER BY (metadata->>'chunk_index')::int
+        LIMIT 1
+        """,
+        doc_id,
+        page_number,
+    )
+    return row["id"] if row else None

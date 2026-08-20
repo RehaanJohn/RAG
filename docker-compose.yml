@@ -42,6 +42,12 @@ x-app-env: &app-env
   GATE_RERANK_THRESHOLD: ${GATE_RERANK_THRESHOLD:-0.0}
   MMR_ENABLED: ${MMR_ENABLED:-false}
   MMR_LAMBDA: ${MMR_LAMBDA:-0.5}
+  # Phase 4 — VLM & Image Support
+  VLM_MODEL: ${VLM_MODEL:-llama3.2-vision}
+  VLM_TIMEOUT: ${VLM_TIMEOUT:-300}
+  IMAGES_DIR: /app/data/images
+  IMAGE_SEARCH_ENABLED: ${IMAGE_SEARCH_ENABLED:-true}
+  IMAGE_REF_CLASSIFY_ENABLED: ${IMAGE_REF_CLASSIFY_ENABLED:-true}
 
 services:
 
@@ -151,6 +157,7 @@ services:
       <<: *app-env
     volumes:
       - raw_files:/app/data/raw
+      - images_data:/app/data/images
       - hf_cache:/root/.cache/huggingface
     ports:
       - "8000:8000"
@@ -179,6 +186,7 @@ services:
       <<: *app-env
     volumes:
       - raw_files:/app/data/raw
+      - images_data:/app/data/images
       - hf_cache:/root/.cache/huggingface
     depends_on:
       supabase-db:
@@ -197,6 +205,8 @@ volumes:
   ollama_models:
     driver: local
   raw_files:
+    driver: local
+  images_data:
     driver: local
   hf_cache:
     driver: local
